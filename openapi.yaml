@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: Local Search API
+  version: 0.1.0
+  description: HTTP API for a local full-text search service.
+paths:
+  /search:
+    get:
+      summary: Search indexed documents
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SearchResult"
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /stats:
+    get:
+      summary: Get index statistics
+      responses:
+        "200":
+          description: Current index state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+  /index/rebuild:
+    post:
+      summary: Rebuild the index from the filesystem
+      responses:
+        "200":
+          description: Rebuild completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: rebuilt
+        "500":
+          description: Rebuild failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  schemas:
+    SearchResult:
+      type: object
+      properties:
+        id:
+          type: string
+          example: notes.txt
+        path:
+          type: string
+          example: notes.txt
+        name:
+          type: string
+          example: notes.txt
+        fragment:
+          type: string
+          example: Go scheduler executes goroutines.
+        score:
+          type: number
+          format: double
+    Stats:
+      type: object
+      properties:
+        documents:
+          type: integer
+          example: 3
+        indexedBytes:
+          type: integer
+          format: int64
+          example: 242
+        lastUpdate:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      properties:
+        error:
+          type: string

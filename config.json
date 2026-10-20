@@ -1,0 +1,13 @@
+{
+  "address": ":8080",
+  "rootDir": "./sample-data",
+  "indexPath": "./data/index",
+  "supportedExtensions": [".txt", ".md", ".go"],
+  "ignoredDirectories": [".git", "node_modules", "vendor", ".idea", "bin", "data"],
+  "maxFileSizeBytes": 10485760,
+  "defaultLimit": 10,
+  "maxLimit": 100,
+  "debounceMs": 300,
+  "updateQueueSize": 128,
+  "updateWorkers": 2
+}

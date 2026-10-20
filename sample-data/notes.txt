@@ -1,0 +1,3 @@
+Go scheduler executes goroutines.
+Channels help goroutines communicate.
+context

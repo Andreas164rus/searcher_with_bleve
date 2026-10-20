@@ -1,0 +1,29 @@
+# Индекс Bleve на диске (пересоздаётся при старте)
+/data/
+
+# Учебные шпаргалки, не в публичный репозиторий
+/docs/
+
+# Собранные бинарники
+/bin/
+/searcher
+/searcher.exe
+*.exe
+
+# Локальный кэш и покрытие тестов
+*.test
+*.out
+coverage.html
+coverage.out
+
+# Зависимости, если когда-нибудь сделаем go mod vendor
+/vendor/
+
+# IDE и ОС
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
