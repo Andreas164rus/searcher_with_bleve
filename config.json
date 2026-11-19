@@ -1,6 +1,6 @@
 {
   "address": ":8080",
-  "rootDir": "./sample-data",
+  "rootDir": "./sample_data/5000",
   "indexPath": "./data/index",
   "supportedExtensions": [".txt", ".md", ".go"],
   "ignoredDirectories": [".git", "node_modules", "vendor", ".idea", "bin", "data"],

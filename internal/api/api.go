@@ -60,8 +60,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	op, err := parseOp(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	results, err := s.service.Search(query, limit)
+	results, err := s.service.Search(query, limit, op)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -90,6 +95,18 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
 	http.ServeFile(w, r, "openapi.yaml")
+}
+
+// parseOp читаем ?op=. Пусто и and — все слова, or — хотя бы одно.
+func parseOp(r *http.Request) (string, error) {
+	op := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("op")))
+	if op == "" || op == "and" {
+		return "and", nil
+	}
+	if op == "or" {
+		return "or", nil
+	}
+	return "", errors.New("op must be and or or")
 }
 
 // parseLimit читаем ?limit=; пустой — defaultLimit, слишком большой — ошибка.

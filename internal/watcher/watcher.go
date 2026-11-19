@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"hash/fnv"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -37,8 +38,10 @@ func New(cfg config.Config, svc *service.Service) *Watcher {
 	return &Watcher{cfg: cfg, service: svc}
 }
 
-// Run подписываемся на папки, запускаем воркеры и собираем события, пока жив ctx.
-func (w *Watcher) Run(ctx context.Context) error {
+// Run подписывается на папки до syncFn и только потом применяет события.
+// Пока идёт первичный обход, события копятся и не затирают индекс старой версией файла.
+// syncFn == nil значит, что обход уже сделан снаружи и события можно применять сразу.
+func (w *Watcher) Run(ctx context.Context, syncFn func(context.Context) error) error {
 	// fsWatcher — слушатель ОС (не наша структура Watcher): события приходят в его каналы.
 	fsWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -46,58 +49,162 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 	defer fsWatcher.Close()
 
-	if err := w.watchDirRecursive(fsWatcher, w.service.RootDir()); err != nil {
-		return err
-	}
+	// Дочерний контекст гасим, если syncFn упала: буфер тогда не проигрываем.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Очередь задач индекса. Буфер, чтобы сборщик не блокировался, пока воркеры читают файлы.
-	updates := make(chan update, w.cfg.UpdateQueueSize)
+	// У каждого воркера своя очередь. Путь всегда попадает в одну и ту же,
+	// поэтому два обновления одного файла не выполняются параллельно.
+	queues := w.workerQueues()
 	var workers sync.WaitGroup
-	for range w.cfg.UpdateWorkers {
+	for _, queue := range queues {
 		workers.Add(1)
-		go func() {
+		go func(queue <-chan update) {
 			defer workers.Done()
-			w.worker(ctx, updates)
-		}()
+			w.worker(runCtx, queue)
+		}(queue)
 	}
 
-	// eventsDone нужен, потому что collectEvents крутится в другой горутине:
-	// Run должен дождаться и сборщика, и воркеров.
+	// Сборщик стартует до подписки: канал fsnotify на macOS без буфера.
+	scanDone := make(chan struct{})
 	eventsDone := make(chan struct{})
 	go func() {
 		defer close(eventsDone)
-		// Сначала события, потом закрываем очередь — воркеры видят !ok и выходят.
-		w.collectEvents(ctx, fsWatcher, updates) // тут говорим fsnotify читай каналы в цикле
-		close(updates)
+		w.collectEvents(runCtx, fsWatcher, queues, scanDone)
+		for _, queue := range queues {
+			close(queue)
+		}
 	}()
+
+	finish := func(err error) error {
+		cancel()
+		<-eventsDone
+		workers.Wait()
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
+	}
+
+	if err := w.watchDirRecursive(fsWatcher, w.service.RootDir()); err != nil {
+		return finish(err)
+	}
+	if syncFn != nil {
+		if err := syncFn(runCtx); err != nil {
+			// Ошибку обхода отдаём наверх и не применяем хвост событий.
+			return finish(err)
+		}
+	}
+	close(scanDone)
 
 	<-eventsDone
 	workers.Wait()
 	return ctx.Err()
 }
 
-// collectEvents копит события и после паузы debounce отправляет по одному обновлению на файл.
-func (w *Watcher) collectEvents(ctx context.Context, fsWatcher *fsnotify.Watcher, updates chan<- update) {
-	// Несколько Write/Chmod одного файла схлопываются: в map остаётся последняя операция.
-	pending := make(map[string]update) // сюда приходят все изменения, чтобы не копить одинаковые изменния,
-	// которые приходят очень быстро, они раскидываются по ключу, и спустя 300 мс отправляем их в updates
-	timer := time.NewTimer(w.cfg.DebounceInterval)
-	if !timer.Stop() {
-		// NewTimer мог сразу сработать; забираем значение, чтобы канал был пустой.
-		<-timer.C
+// workerQueues делит updateQueueSize между воркерами. У каждого свой канал, буфер не меньше 1.
+func (w *Watcher) workerQueues() []chan update {
+	n := w.cfg.UpdateWorkers
+	if n < 1 {
+		n = 1
 	}
+	size := w.cfg.UpdateQueueSize
+	base := size / n
+	extra := size % n
+	if base < 1 {
+		// Иначе при маленькой очереди часть воркеров получила бы буфер 0.
+		base = 1
+		extra = 0
+	}
+
+	queues := make([]chan update, n)
+	for i := range queues {
+		buf := base
+		if i < extra {
+			buf++
+		}
+		queues[i] = make(chan update, buf)
+	}
+	return queues
+}
+
+// shard всегда возвращает один и тот же номер очереди для одного пути.
+func shard(path string, n int) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(path))
+	return int(h.Sum32() % uint32(n))
+}
+
+// collectEvents копит события и после паузы debounce отправляет по одному обновлению на файл.
+// До закрытия scanDone события только складываются в буфер: обход индекса в это время ещё идёт.
+func (w *Watcher) collectEvents(ctx context.Context, fsWatcher *fsnotify.Watcher, updates []chan update, scanDone <-chan struct{}) {
+	// Несколько Write/Chmod одного файла схлопываются: в map остаётся последняя операция.
+	pending := make(map[string]update)
+	// quiet сбрасывается каждым новым событием: ждём тишину DebounceInterval.
+	// maxWait стартует один раз на пачку и не сбрасывается, иначе непрерывный поток
+	// событий никогда не дойдёт до flush.
+	quiet := time.NewTimer(w.cfg.DebounceInterval)
+	maxWait := time.NewTimer(2 * w.cfg.DebounceInterval)
+	quiet.Stop()
+	maxWait.Stop()
+	defer quiet.Stop()
+	defer maxWait.Stop()
+	window := false // true, пока в этой пачке уже запущен maxWait
+	var buffered []fsnotify.Event
 
 	flush := func() {
 		for key, item := range pending {
 			select {
-			case updates <- item:
+			case updates[shard(item.path, len(updates))] <- item:
 			case <-ctx.Done():
 				return
 			}
 			delete(pending, key)
 		}
 	}
+	// Закрываем окно после flush, чтобы следующее событие снова запустило maxWait.
+	disarm := func() {
+		window = false
+		quiet.Stop()
+		maxWait.Stop()
+	}
+	note := func(event fsnotify.Event) {
+		if !w.handleEvent(fsWatcher, event, pending) {
+			// Игнор и пустая папка в pending не попадают и таймеры не двигают.
+			return
+		}
+		if !window {
+			maxWait.Reset(2 * w.cfg.DebounceInterval)
+			window = true
+		}
+		quiet.Reset(w.cfg.DebounceInterval)
+	}
 
+	for {
+		select {
+		case <-ctx.Done():
+			// Обход не закончился: буфер не применяем, чтобы не писать в закрывающийся индекс.
+			return
+		case <-scanDone:
+			for _, event := range buffered {
+				note(event)
+			}
+			buffered = nil
+			goto live
+		case err, ok := <-fsWatcher.Errors:
+			if !ok {
+				return
+			}
+			slog.Warn("ошибка слежения за файлами", "error", err)
+		case event, ok := <-fsWatcher.Events:
+			if !ok {
+				return
+			}
+			buffered = append(buffered, event)
+		}
+	}
+
+live:
 	for {
 		select {
 		case <-ctx.Done():
@@ -113,38 +220,50 @@ func (w *Watcher) collectEvents(ctx context.Context, fsWatcher *fsnotify.Watcher
 				flush()
 				return
 			}
-			w.handleEvent(fsWatcher, event, pending)
-			// Каждое новое событие сбрасывает таймер: ждём тишину debounceMs.
-			timer.Reset(w.cfg.DebounceInterval)
-		case <-timer.C:
+			note(event)
+		case <-quiet.C:
 			flush()
+			disarm()
+		case <-maxWait.C:
+			flush()
+			disarm()
 		}
 	}
 }
 
 // handleEvent превращаем событие ОС в upsert или delete. Несколько событий одного файла перезаписывают pending.
-func (w *Watcher) handleEvent(fsWatcher *fsnotify.Watcher, event fsnotify.Event, pending map[string]update) {
+// true — в pending появилась или обновилась задача, и debounce нужно завести.
+func (w *Watcher) handleEvent(fsWatcher *fsnotify.Watcher, event fsnotify.Event, pending map[string]update) bool {
 	if w.service.ShouldIgnorePath(event.Name) {
-		return
+		return false
 	}
 
+	queued := false
 	if event.Has(fsnotify.Create) {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 			// Новую папку тоже начинаем слушать: подписка родителя не покрывает вложенные каталоги.
 			if err := w.watchDirRecursive(fsWatcher, event.Name); err != nil {
 				slog.Warn("не удалось подписаться на новую папку", "path", event.Name, "error", err)
 			}
-			return
+			// Переименование папки приходит как Create без событий на каждый файл внутри.
+			if w.queueTree(event.Name, pending) {
+				queued = true
+			}
+		} else {
+			pending[event.Name] = update{path: event.Name, op: opUpsert}
+			queued = true
 		}
-		pending[event.Name] = update{path: event.Name, op: opUpsert}
 	}
 	if event.Has(fsnotify.Write) || event.Has(fsnotify.Chmod) {
 		pending[event.Name] = update{path: event.Name, op: opUpsert}
+		queued = true
 	}
 	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-		// Rename для старого пути — это удаление; новый путь обычно приходит отдельным CREATE.
+		// Rename старого пути удаляет документ или всю папку. Новый путь приходит отдельным CREATE.
 		pending[event.Name] = update{path: event.Name, op: opDelete}
+		queued = true
 	}
+	return queued
 }
 
 // worker читает очередь и обновляет индекс. Тяжёлую работу не делаем внутри collectEvents.
@@ -158,7 +277,8 @@ func (w *Watcher) worker(ctx context.Context, updates <-chan update) {
 				return
 			}
 			if item.op == opDelete {
-				if err := w.service.DeletePath(item.path); err != nil {
+				// Для файла снимется один документ, для папки — все документы внутри.
+				if err := w.service.DeletePrefix(item.path); err != nil {
 					slog.Warn("не удалось удалить из индекса", "path", item.path, "error", err)
 				}
 				continue
@@ -168,6 +288,36 @@ func (w *Watcher) worker(ctx context.Context, updates <-chan update) {
 			}
 		}
 	}
+}
+
+// queueTree ставит в очередь все поддерживаемые файлы внутри папки. Саму папку не индексируем.
+func (w *Watcher) queueTree(root string, pending map[string]update) bool {
+	queued := false
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			slog.Warn("пропускаем путь при обходе новой папки", "path", path, "error", walkErr)
+			return nil
+		}
+		if entry.IsDir() {
+			if path != root && w.service.ShouldIgnorePath(path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if w.service.ShouldIgnorePath(path) || !w.service.IsSupported(path) {
+			return nil
+		}
+		pending[path] = update{path: path, op: opUpsert}
+		queued = true
+		return nil
+	})
+	if err != nil {
+		slog.Warn("не удалось обойти новую папку", "path", root, "error", err)
+	}
+	return queued
 }
 
 // watchDirRecursive вешаем fsnotify на все вложенные папки, ignored пропускаем.

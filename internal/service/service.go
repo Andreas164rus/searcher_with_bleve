@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"local-search/internal/config"
@@ -61,11 +64,19 @@ func (s *Service) BuildInitialIndex(ctx context.Context) error {
 }
 
 // Search ищем по индексу, файлы заново не читаем.
-func (s *Service) Search(query string, limit int) ([]document.Document, error) {
+// op: "and" — все слова, "or" — хотя бы одно.
+func (s *Service) Search(query string, limit int, op string) ([]document.Document, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.index.Search(query, limit)
+	return s.index.Search(query, limit, op)
+}
+
+// UpdateCount сколько раз индекс принимал документ.
+func (s *Service) UpdateCount() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.index.UpdateCount()
 }
 
 // Stats отдаём количество документов, размер и время обновления.
@@ -77,14 +88,17 @@ func (s *Service) Stats() search.Stats {
 }
 
 // Rebuild полностью пересобираем индекс. Поиск в это время ждёт write-lock.
+// Новый индекс сначала собираем рядом: закрытый Bleve не всегда сразу отпускает свою папку.
 func (s *Service) Rebuild(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.index.Close(); err != nil {
+	tmpPath := s.cfg.IndexPath + ".rebuild"
+	if err := search.RemoveIndexDir(tmpPath); err != nil {
 		return err
 	}
-	idx, err := search.Recreate(s.cfg.IndexPath)
+
+	idx, err := search.New(tmpPath)
 	if err != nil {
 		return err
 	}
@@ -95,10 +109,52 @@ func (s *Service) Rebuild(ctx context.Context) error {
 		return idx.IndexDocument(doc)
 	}); err != nil {
 		_ = idx.Close()
+		_ = search.RemoveIndexDir(tmpPath)
 		return err
 	}
-	s.index = idx
+	// Закрываем временный индекс, чтобы его папку можно было перенести.
+	if err := idx.Close(); err != nil {
+		_ = search.RemoveIndexDir(tmpPath)
+		return err
+	}
+
+	if err := s.index.Close(); err != nil {
+		return s.keepOldIndex(tmpPath, fmt.Errorf("close index: %w", err))
+	}
+	if err := search.RemoveIndexDir(s.cfg.IndexPath); err != nil {
+		return s.keepOldIndex(tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, s.cfg.IndexPath); err != nil {
+		// Старой папки уже нет. Открываем собранный индекс там, где он остался.
+		if opened, openErr := search.Open(tmpPath); openErr == nil {
+			opened.CopyCountersFrom(idx)
+			s.index = opened
+		}
+		return err
+	}
+
+	opened, err := search.Open(s.cfg.IndexPath)
+	if err != nil {
+		// Папка уже на месте. Пробуем открыть её в старом объекте, чтобы поиск не остался закрытым.
+		if reopenErr := s.index.Reopen(); reopenErr != nil {
+			return fmt.Errorf("open rebuilt index: %w (reopen: %v)", err, reopenErr)
+		}
+		s.index.CopyCountersFrom(idx)
+		return nil
+	}
+	opened.CopyCountersFrom(idx)
+	s.index = opened
 	return nil
+}
+
+// keepOldIndex снова открываем прежний индекс и убираем временную папку.
+func (s *Service) keepOldIndex(tmpPath string, cause error) error {
+	reopenErr := s.index.Reopen()
+	_ = search.RemoveIndexDir(tmpPath)
+	if reopenErr != nil {
+		return fmt.Errorf("%w (reopen: %v)", cause, reopenErr)
+	}
+	return cause
 }
 
 // UpsertPath читаем один файл и обновляем только его документ в индексе.
@@ -112,8 +168,8 @@ func (s *Service) UpsertPath(path string) error {
 		return err
 	}
 	if !ok {
-		// Файл не подходит — не трогаем индекс.
-		return nil
+		// Файл больше лимита, пропал или стал ссылкой: старый документ в индексе не оставляем.
+		return s.DeletePath(path)
 	}
 
 	s.mu.RLock()
@@ -133,6 +189,26 @@ func (s *Service) DeletePath(path string) error {
 	defer s.mu.RUnlock()
 	if err := s.index.DeleteDocument(id); err != nil {
 		slog.Warn("delete from index failed", "path", path, "error", err)
+		return err
+	}
+	return nil
+}
+
+// DeletePrefix удаляет документ и всё, что проиндексировано внутри этой папки.
+func (s *Service) DeletePrefix(path string) error {
+	id, err := filepath.Rel(s.scanner.RootDir(), path)
+	if err != nil {
+		return err
+	}
+	id = filepath.ToSlash(id)
+	if id == "." || id == "" || id == ".." || strings.HasPrefix(id, "../") {
+		return nil
+	}
+
+	s.mu.RLock() // не меняй указатель s.index
+	defer s.mu.RUnlock()
+	if err := s.index.DeletePrefix(id); err != nil {
+		slog.Warn("delete prefix from index failed", "path", path, "error", err)
 		return err
 	}
 	return nil
