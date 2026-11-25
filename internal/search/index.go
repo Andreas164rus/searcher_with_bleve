@@ -76,11 +76,13 @@ const removeIndexAttempts = 8
 // RemoveIndexDir удаляем папку индекса. Повторяем, если первая попытка не прошла.
 // Чужой каталог, корень диска и каталог проекта не трогаем.
 func RemoveIndexDir(path string) error {
+	// Один и тот же каталог из "./data/index" и из абсолютного пути должен проверяться одинаково.
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
 	abs = filepath.Clean(abs)
+	// У корня диска родительский путь совпадает с ним самим. RemoveAll("/") стёр бы файловую систему.
 	if abs == string(filepath.Separator) || abs == filepath.Dir(abs) {
 		return fmt.Errorf("отказ удалять %s: это корень файловой системы", abs)
 	}
@@ -88,10 +90,12 @@ func RemoveIndexDir(path string) error {
 	info, err := os.Stat(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Индекса ещё нет — удалять нечего, для старта и rebuild это нормально.
 			return nil
 		}
 		return err
 	}
+	// indexPath должен быть папкой Bleve, а не обычным файлом.
 	if !info.IsDir() {
 		return fmt.Errorf("отказ удалять %s: это не папка индекса", abs)
 	}
@@ -103,6 +107,7 @@ func RemoveIndexDir(path string) error {
 			return err
 		}
 	}
+	// index_meta.json создаёт сам Bleve. Нет этого файла — папка чужая.
 	meta, err := os.Stat(filepath.Join(abs, "index_meta.json"))
 	if err != nil || meta.IsDir() {
 		if err != nil && !os.IsNotExist(err) {
