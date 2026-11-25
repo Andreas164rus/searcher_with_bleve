@@ -20,6 +20,14 @@ paths:
             type: integer
             minimum: 1
             maximum: 100
+        - name: op
+          in: query
+          required: false
+          description: and requires every term, or requires at least one. Default is and.
+          schema:
+            type: string
+            enum: [and, or]
+            default: and
       responses:
         "200":
           description: Search results

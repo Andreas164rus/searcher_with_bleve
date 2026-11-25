@@ -36,18 +36,39 @@ func Run(parent context.Context, cfg config.Config) error {
 		}
 	}()
 
-	// Обходим папку и кладём подходящие файлы в индекс.
-	if err := svc.BuildInitialIndex(ctx); err != nil {
+	// Watcher подписывается до обхода. События во время индексации копятся и применяются после неё.
+	ready := make(chan struct{}) // канал для сигнала о том, что индексирование завершено
+	startErr := make(chan error, 1) // канал для ошибок при запуске watcher
+	go func() {
+		w := watcher.New(cfg, svc)
+		err := w.Run(ctx, func(ctx context.Context) error {
+			if err := svc.BuildInitialIndex(ctx); err != nil {
+				return err
+			}
+			slog.Info("Индексирование готово", "stats", svc.Stats())
+			close(ready)
+			return nil
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("watcher failed", "error", err)
+			stop()
+		}
+		select {
+		case startErr <- err:
+		default:
+		}
+	}()
+
+	select {
+	case err := <-startErr:
 		return err
+	case <-ready:
 	}
-	slog.Info("Индексирование готово", "stats", svc.Stats())
 
 	// Собираем HTTP-сервер, порт ещё не слушаем.
 	httpServer := newHTTPServer(cfg, svc)
 	// Запускаем HTTP в отдельной горутине, чтобы не заблокировать Run.
 	go serveHTTP(ctx, httpServer, stop)
-	// Параллельно следим за файлами.
-	go runWatcher(ctx, cfg, svc, stop)
 
 	// Ждём, пока контекст не отменится. Дальше не идём, пока сервис работает.
 	<-ctx.Done()
@@ -86,14 +107,4 @@ func serveHTTP(ctx context.Context, httpServer *http.Server, stop context.Cancel
 	}
 	// Держим горутину до общей остановки.
 	<-ctx.Done()
-}
-
-// runWatcher следит за файловой системой, пока жив ctx.
-func runWatcher(ctx context.Context, cfg config.Config, svc *service.Service, stop context.CancelFunc) {
-	w := watcher.New(cfg, svc)
-	if err := w.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		// context.Canceled — обычная остановка по Ctrl+C, её пропускаем.
-		slog.Error("watcher failed", "error", err)
-		stop()
-	}
 }
