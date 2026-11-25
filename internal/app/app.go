@@ -37,8 +37,8 @@ func Run(parent context.Context, cfg config.Config) error {
 	}()
 
 	// Watcher подписывается до обхода. События во время индексации копятся и применяются после неё.
-	ready := make(chan struct{})
-	startErr := make(chan error, 1)
+	ready := make(chan struct{}) // канал для сигнала о том, что индексирование завершено
+	startErr := make(chan error, 1) // канал для ошибок при запуске watcher
 	go func() {
 		w := watcher.New(cfg, svc)
 		err := w.Run(ctx, func(ctx context.Context) error {

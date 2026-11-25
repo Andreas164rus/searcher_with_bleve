@@ -65,9 +65,9 @@ func (w *Watcher) Run(ctx context.Context, syncFn func(context.Context) error) e
 		}(queue)
 	}
 
-	// Сборщик стартует до подписки: канал fsnotify на macOS без буфера.
-	scanDone := make(chan struct{})
-	eventsDone := make(chan struct{})
+	// Сборщик стартует до подписки
+	scanDone := make(chan struct{}) // канал для сигнала о том, что индексирование завершено
+	eventsDone := make(chan struct{}) // канал для сигнала о том, что события обработаны
 	go func() {
 		defer close(eventsDone)
 		w.collectEvents(runCtx, fsWatcher, queues, scanDone)
